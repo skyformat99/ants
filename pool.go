@@ -53,6 +53,9 @@ type Pool struct {
 	// lock for synchronous operation.
 	lock sync.Mutex
 
+	// cond for waiting to get a idle worker
+	cond *sync.Cond
+
 	once sync.Once
 }
 
@@ -105,6 +108,7 @@ func NewTimingPool(size, expiry int) (*Pool, error) {
 		release:        make(chan sig, 1),
 		expiryDuration: time.Duration(expiry) * time.Second,
 	}
+	p.cond = sync.NewCond(&p.lock)
 	go p.periodicallyPurge()
 	return p, nil
 }
@@ -142,10 +146,8 @@ func (p *Pool) ReSize(size int) {
 	}
 	atomic.StoreInt32(&p.capacity, int32(size))
 	diff := p.Running() - size
-	if diff > 0 {
-		for i := 0; i < diff; i++ {
-			p.getWorker().task <- nil
-		}
+	for i := 0; i < diff; i++ {
+		p.getWorker().task <- nil
 	}
 }
 
@@ -183,6 +185,7 @@ func (p *Pool) getWorker() *Worker {
 	waiting := false
 
 	p.lock.Lock()
+	defer p.lock.Unlock()
 	idleWorkers := p.workers
 	n := len(idleWorkers) - 1
 	if n < 0 {
@@ -192,21 +195,17 @@ func (p *Pool) getWorker() *Worker {
 		idleWorkers[n] = nil
 		p.workers = idleWorkers[:n]
 	}
-	p.lock.Unlock()
 
 	if waiting {
 		for {
-			p.lock.Lock()
-			idleWorkers = p.workers
-			l := len(idleWorkers) - 1
+			p.cond.Wait()
+			l := len(p.workers) - 1
 			if l < 0 {
-				p.lock.Unlock()
 				continue
 			}
-			w = idleWorkers[l]
-			idleWorkers[l] = nil
-			p.workers = idleWorkers[:l]
-			p.lock.Unlock()
+			w = p.workers[l]
+			p.workers[l] = nil
+			p.workers = p.workers[:l]
 			break
 		}
 	} else if w == nil {
@@ -225,5 +224,7 @@ func (p *Pool) putWorker(worker *Worker) {
 	worker.recycleTime = time.Now()
 	p.lock.Lock()
 	p.workers = append(p.workers, worker)
+	//通知有一个空闲的worker
+	p.cond.Signal()
 	p.lock.Unlock()
 }
